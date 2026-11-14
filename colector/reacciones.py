@@ -163,7 +163,8 @@ def valido(doc):
         return False
     for bid, a in ag.items():
         try:
-            if not BID.fullmatch(bid) or a["divisa"] != bid[14:] or not isinstance(a["min"], int):
+            if (not BID.fullmatch(bid) or a["divisa"] != bid[14:] or isinstance(a["min"], bool)
+                    or not isinstance(a["min"], int)):
                 return False
             for k in ("utc", "ini", "fin"):
                 de_iso(a[k])
@@ -227,21 +228,28 @@ def main(ruta, ahora=None, feed=None, descargar=barras, publicados=datos_publica
         doc["agenda"] = dict(previo.get("agenda", {}))
         if previo.get("ff"):
             doc["ff"] = previo["ff"]
-    if feed is None and (not doc.get("ff") or t - de_iso(doc["ff"]) >= CADA_FF):
+    bls = {}
+    ultimo = de_iso(doc["ff"]) if doc.get("ff") else None
+    if feed is None and (ultimo is None or ultimo > t or t - ultimo >= CADA_FF):
+        doc["ff"] = iso(t)   # el intento cuenta aunque falle: un 429 no hace pedir el feed cada hora
         try:
             feed = http_json(FF_URL)
-        except Exception as ex:   # p. ej., 429: se sigue con la agenda guardada; se reintenta en la siguiente
+        except Exception as ex:   # p. ej., 429: se sigue con la agenda guardada; se reintenta pasadas 3 h
             print(f"sin calendario ({ex})", file=sys.stderr)
-            if not doc["agenda"]:
-                return None
-    bls = {}
-    if feed is not None:
-        bls = bloques(feed)
+    elif feed is not None:
         doc["ff"] = iso(t)
-        for bid, b in bls.items():
-            doc["agenda"][bid] = derivada(b)
-    # la agenda solo guarda lo que aún se puede medir
-    ag = {bid: a for bid, a in sorted(doc["agenda"].items()) if de_iso(a["utc"]) + LIMITE >= t}
+    if feed is not None:
+        try:
+            bls = bloques(feed)
+            nuevas = {bid: derivada(b) for bid, b in bls.items()}
+        except Exception as ex:   # un feed con forma rara no rompe la ejecución: se sigue con la agenda guardada
+            print(f"calendario no válido ({ex})", file=sys.stderr)
+            bls, nuevas = {}, {}
+        doc["agenda"].update(nuevas)
+    # la agenda solo guarda lo que aún se puede medir y, del futuro, solo hasta poco después del próximo feed (no se
+    # republica el calendario de la semana)
+    ag = {bid: a for bid, a in sorted(doc["agenda"].items())
+          if de_iso(a["utc"]) + LIMITE >= t and de_iso(a["utc"]) <= t + CADA_FF + timedelta(hours=1)}
     doc["agenda"] = dict(list(ag.items())[-MAX_AGENDA:])
     pend = [bid for bid, a in doc["agenda"].items()
             if de_iso(a["fin"]) + MARGEN <= t <= de_iso(a["utc"]) + LIMITE
