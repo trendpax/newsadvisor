@@ -4,7 +4,9 @@ Lo ejecuta GitHub Actions cada hora. Mide, con las velas de biquote, cómo se mo
 histórica de cada noticia de alto impacto ya publicada (la misma ventana y los mismos instrumentos que el programa) y
 actualiza reacciones.json en la rama «datos». Solo publica resultados derivados por publicación (pips), nunca velas, ni
 títulos ni consensos de terceros: cada serie se identifica con un hash corto de su título normalizado, que el programa
-calcula igual desde su propio calendario.
+calcula igual desde su propio calendario. También publica «equivalencias»: el id de serie del calendario de biquote de
+cada serie ya registrada → su hash, para que el programa reconozca la misma serie en las semanas que Forex Factory aún no
+cubre (allí los títulos vienen del proveedor y no coinciden). Sale de la consulta del dato publicado: sin peticiones extra.
 
 Uso: python colector/reacciones.py RUTA/reacciones.json
 Sin dependencias (solo la biblioteca estándar). Sin secretos. Sale con código distinto de 0 sin escribir nada si algo no
@@ -41,6 +43,9 @@ MAX_REGISTROS = 5000
 MAX_BYTES = 2_000_000
 MAX_DESCARGA = 5_000_000
 HEX12 = re.compile(r"[0-9a-f]{12}")
+ID_BQ = re.compile(r"[a-z0-9_]{1,20}:[0-9]{1,15}")
+MAX_EQUIVALENCIAS = 2000
+MAX_SIN_EQ = 3   # bloques ya registrados a los que, como mucho, se busca la equivalencia en cada ejecución
 
 
 # ---------------------------------------------------------------- utilidades
@@ -122,20 +127,22 @@ def valor_bq(v, mult):
 
 
 def datos_publicados(b):
-    """{hash de serie: dato publicado según biquote} para los eventos del bloque que ya lo tienen."""
+    """({hash de serie: dato publicado según biquote}, {id de serie de biquote: hash de serie}) del bloque."""
     q = urllib.parse.urlencode({"from": iso(b["utc"] - timedelta(minutes=1)), "to": iso(b["utc"] + timedelta(minutes=1)),
                                 "countries": PAISES["USD" if b["divisa"] == "OIL" else b["divisa"]], "limit": 100})
     cands = []
     for imp in ("high", "medium"):
         cands += http_json(f"{BQ}/calendar?{q}&importance={imp}")
-    out = {}
+    out, eq = {}, {}
     for e in b["eventos"]:
         c = _emparejar(e, cands)
+        if c and isinstance(c.get("eventId"), str) and ID_BQ.fullmatch(c["eventId"]):
+            eq[c["eventId"]] = serie(b["divisa"], e["titulo"])
         if c and c.get("actual") is not None:
             v = valor_bq(c["actual"], c.get("multiplier"))
             if isinstance(v, (int, float)) and math.isfinite(v):
                 out[serie(b["divisa"], e["titulo"])] = round(float(v), 6)
-    return out
+    return out, eq
 
 
 # ---------------------------------------------------------------- validación (la misma que aplica el programa)
@@ -143,6 +150,10 @@ def valido(doc):
     if not isinstance(doc, dict) or doc.get("v") != 1 or not isinstance(doc.get("registros"), dict):
         return False
     if len(doc["registros"]) > MAX_REGISTROS:
+        return False
+    eq = doc.get("equivalencias", {})
+    if not isinstance(eq, dict) or len(eq) > MAX_EQUIVALENCIAS or not all(
+            isinstance(k, str) and ID_BQ.fullmatch(k) and isinstance(x, str) and HEX12.fullmatch(x) for k, x in eq.items()):
         return False
     for bid, r in doc["registros"].items():
         if not re.fullmatch(r"\d{8}-\d{4}-(USD|EUR|GBP|JPY|CHF|CAD|AUD|NZD|OIL)", bid) or not isinstance(r, dict):
@@ -173,24 +184,33 @@ def valido(doc):
 
 def main(ruta, ahora=None, feed=None, descargar=barras, publicados=datos_publicados):
     t = ahora or datetime.now(timezone.utc)
-    doc = {"v": 1, "fuente": FUENTE, "generado": iso(t), "registros": {}}
+    doc = {"v": 1, "fuente": FUENTE, "generado": iso(t), "registros": {}, "equivalencias": {}}
     if os.path.exists(ruta):
         with open(ruta, encoding="utf-8") as f:
             previo = json.load(f)
         if not valido(previo):
             raise SystemExit("el reacciones.json actual no es válido: no se toca")
         doc["registros"] = previo["registros"]
+        doc["equivalencias"] = dict(previo.get("equivalencias", {}))
     if feed is None:
         try:
             feed = http_json(FF_URL)
         except Exception as ex:   # p. ej., 429: se reintenta en la ejecución siguiente, sin publicar nada
             print(f"sin calendario ({ex}): nada que hacer", file=sys.stderr)
             return None
-    pend = [b for b in bloques(feed).values()
+    bls = bloques(feed)
+    pend = [b for b in bls.values()
             if ventana(b)["salida"] + MARGEN <= t <= b["utc"] + LIMITE
             and (b["id"] not in doc["registros"] or not doc["registros"][b["id"]].get("actual"))]
+    con_eq = set(doc["equivalencias"].values())
+    sin_eq = [b for b in bls.values() if b["id"] in doc["registros"] and b not in pend and b["utc"] <= t
+              and any(serie(b["divisa"], e["titulo"]) not in con_eq for e in b["eventos"]
+                      if (indicador(e["titulo"]) or ("texto",))[0] != "texto")]
+    if sin_eq:   # rotando, para que un bloque que nunca empareja no tape a los demás
+        i = t.hour % len(sin_eq)
+        sin_eq = (sin_eq[i:] + sin_eq[:i])[:MAX_SIN_EQ]
     cache, nuevos, cambios = {}, 0, 0
-    for b in pend:
+    for b in pend + sin_eq:
         r = doc["registros"].get(b["id"])
         if r is None:
             intervalo, paso = ("1m", timedelta(minutes=1)) if t - b["utc"] <= CON_1M else ("5m", timedelta(minutes=5))
@@ -214,10 +234,15 @@ def main(ruta, ahora=None, feed=None, descargar=barras, publicados=datos_publica
                  "pares": pares, "actual": {}}
             nuevos += 1
         try:
-            act = publicados(b)
+            res = publicados(b)
+            act, eq = res if isinstance(res, tuple) else (res, {})
             if act and act != r.get("actual"):
                 r["actual"] = act
                 cambios += 1
+            for k, s in eq.items():
+                if doc["equivalencias"].get(k) != s and len(doc["equivalencias"]) < MAX_EQUIVALENCIAS:
+                    doc["equivalencias"][k] = s
+                    cambios += 1
         except Exception as ex:
             print(f"aviso: dato publicado {b['id']}: {ex}", file=sys.stderr)
         doc["registros"][b["id"]] = r
