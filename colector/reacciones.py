@@ -1,7 +1,8 @@
 """Colector público del registro compartido de «Reacciones pasadas» de News Advisor (TrendPax).
 
-Lo ejecuta GitHub Actions cada hora. Mide, con las velas de biquote, cómo se movieron los pares en la ventana de reacción
-histórica de cada noticia de alto impacto ya publicada (la misma ventana y los mismos instrumentos que el programa) y
+Lo ejecuta GitHub Actions cada hora; el feed de Forex Factory se pide como mucho cada 3 h y, entre medias, se mide con
+una agenda derivada guardada en el propio JSON (horas, ventanas y hashes de las series; sin títulos ni consensos). Mide,
+con las velas de biquote, cómo se movieron los pares en la ventana de reacción histórica de cada noticia de alto impacto ya publicada (la misma ventana y los mismos instrumentos que el programa) y
 actualiza reacciones.json en la rama «datos». Solo publica resultados derivados por publicación (pips), nunca velas, ni
 títulos ni consensos de terceros: cada serie se identifica con un hash corto de su título normalizado, que el programa
 calcula igual desde su propio calendario. También publica «equivalencias»: el id de serie del calendario de biquote de
@@ -46,6 +47,9 @@ HEX12 = re.compile(r"[0-9a-f]{12}")
 ID_BQ = re.compile(r"[a-z0-9_]{1,20}:[0-9]{1,15}")
 MAX_EQUIVALENCIAS = 2000
 MAX_SIN_EQ = 3   # bloques ya registrados a los que, como mucho, se busca la equivalencia en cada ejecución
+CADA_FF = timedelta(hours=3)   # norma del proyecto: el feed de Forex Factory, como mucho 1 petición cada 3 h
+MAX_AGENDA = 200
+BID = re.compile(r"\d{8}-\d{4}-(USD|EUR|GBP|JPY|CHF|CAD|AUD|NZD|OIL)")
 
 
 # ---------------------------------------------------------------- utilidades
@@ -102,14 +106,13 @@ def barras(par, intervalo):
             for b in d.get("bars", []) if not b.get("isOpen")}
 
 
-def medir(velas, b, paso):
-    v = ventana(b)
-
+def medir(velas, a, paso):
+    """a: entrada de la agenda derivada (hora del dato y ventana)."""
     def suelo(x):
         m = paso.seconds // 60
         return x.replace(second=0, microsecond=0) - timedelta(minutes=x.minute % m)
 
-    t0, ini, fin = suelo(b["utc"]), suelo(v["entrada"]), suelo(v["salida"]) - paso
+    t0, ini, fin = suelo(de_iso(a["utc"])), suelo(de_iso(a["ini"])), suelo(de_iso(a["fin"])) - paso
     if any(x not in velas for x in (t0, ini, fin)):
         return None
     tramo = [x for k, x in velas.items() if t0 <= k <= fin]
@@ -155,8 +158,27 @@ def valido(doc):
     if not isinstance(eq, dict) or len(eq) > MAX_EQUIVALENCIAS or not all(
             isinstance(k, str) and ID_BQ.fullmatch(k) and isinstance(x, str) and HEX12.fullmatch(x) for k, x in eq.items()):
         return False
+    ag = doc.get("agenda", {})
+    if not isinstance(ag, dict) or len(ag) > MAX_AGENDA:
+        return False
+    for bid, a in ag.items():
+        try:
+            if not BID.fullmatch(bid) or a["divisa"] != bid[14:] or not isinstance(a["min"], int):
+                return False
+            for k in ("utc", "ini", "fin"):
+                de_iso(a[k])
+        except (KeyError, ValueError, TypeError, AttributeError):
+            return False
+        cl = a.get("claves")
+        if not isinstance(cl, list) or not 1 <= len(cl) <= 10 or not all(isinstance(c, str) and HEX12.fullmatch(c) for c in cl):
+            return False
+    if "ff" in doc:
+        try:
+            de_iso(doc["ff"])
+        except (ValueError, TypeError, AttributeError):
+            return False
     for bid, r in doc["registros"].items():
-        if not re.fullmatch(r"\d{8}-\d{4}-(USD|EUR|GBP|JPY|CHF|CAD|AUD|NZD|OIL)", bid) or not isinstance(r, dict):
+        if not BID.fullmatch(bid) or not isinstance(r, dict):
             return False
         try:
             de_iso(r["utc"])
@@ -182,9 +204,19 @@ def valido(doc):
     return True
 
 
+def derivada(b):
+    """Lo que el colector necesita de un bloque para medirlo sin el calendario: hora, ventana y series (hashes)."""
+    v = ventana(b)
+    return {"divisa": b["divisa"], "utc": iso(b["utc"]), "ini": iso(v["entrada"]), "fin": iso(v["salida"]),
+            "min": v["min"], "claves": sorted({serie(b["divisa"], e["titulo"]) for e in b["eventos"]})[:10]}
+
+
 def main(ruta, ahora=None, feed=None, descargar=barras, publicados=datos_publicados):
+    """Cada ejecución mide con la agenda derivada guardada; el feed de Forex Factory se pide como mucho cada 3 h (para
+    renovar la agenda, el dato publicado y las equivalencias, que necesitan los títulos)."""
     t = ahora or datetime.now(timezone.utc)
-    doc = {"v": 1, "fuente": FUENTE, "generado": iso(t), "registros": {}, "equivalencias": {}}
+    doc = {"v": 1, "fuente": FUENTE, "generado": iso(t), "registros": {}, "equivalencias": {}, "agenda": {}}
+    previo = None
     if os.path.exists(ruta):
         with open(ruta, encoding="utf-8") as f:
             previo = json.load(f)
@@ -192,61 +224,74 @@ def main(ruta, ahora=None, feed=None, descargar=barras, publicados=datos_publica
             raise SystemExit("el reacciones.json actual no es válido: no se toca")
         doc["registros"] = previo["registros"]
         doc["equivalencias"] = dict(previo.get("equivalencias", {}))
-    if feed is None:
+        doc["agenda"] = dict(previo.get("agenda", {}))
+        if previo.get("ff"):
+            doc["ff"] = previo["ff"]
+    if feed is None and (not doc.get("ff") or t - de_iso(doc["ff"]) >= CADA_FF):
         try:
             feed = http_json(FF_URL)
-        except Exception as ex:   # p. ej., 429: se reintenta en la ejecución siguiente, sin publicar nada
-            print(f"sin calendario ({ex}): nada que hacer", file=sys.stderr)
-            return None
-    bls = bloques(feed)
-    pend = [b for b in bls.values()
-            if ventana(b)["salida"] + MARGEN <= t <= b["utc"] + LIMITE
-            and (b["id"] not in doc["registros"] or not doc["registros"][b["id"]].get("actual"))]
+        except Exception as ex:   # p. ej., 429: se sigue con la agenda guardada; se reintenta en la siguiente
+            print(f"sin calendario ({ex})", file=sys.stderr)
+            if not doc["agenda"]:
+                return None
+    bls = {}
+    if feed is not None:
+        bls = bloques(feed)
+        doc["ff"] = iso(t)
+        for bid, b in bls.items():
+            doc["agenda"][bid] = derivada(b)
+    # la agenda solo guarda lo que aún se puede medir
+    ag = {bid: a for bid, a in sorted(doc["agenda"].items()) if de_iso(a["utc"]) + LIMITE >= t}
+    doc["agenda"] = dict(list(ag.items())[-MAX_AGENDA:])
+    pend = [bid for bid, a in doc["agenda"].items()
+            if de_iso(a["fin"]) + MARGEN <= t <= de_iso(a["utc"]) + LIMITE
+            and (bid not in doc["registros"] or not doc["registros"][bid].get("actual"))]
     con_eq = set(doc["equivalencias"].values())
-    sin_eq = [b for b in bls.values() if b["id"] in doc["registros"] and b not in pend and b["utc"] <= t
+    sin_eq = [b["id"] for b in bls.values() if b["id"] in doc["registros"] and b["id"] not in pend and b["utc"] <= t
               and any(serie(b["divisa"], e["titulo"]) not in con_eq for e in b["eventos"]
                       if (indicador(e["titulo"]) or ("texto",))[0] != "texto")]
     if sin_eq:   # rotando, para que un bloque que nunca empareja no tape a los demás
         i = t.hour % len(sin_eq)
         sin_eq = (sin_eq[i:] + sin_eq[:i])[:MAX_SIN_EQ]
     cache, nuevos, cambios = {}, 0, 0
-    for b in pend + sin_eq:
-        r = doc["registros"].get(b["id"])
+    for bid in pend + sin_eq:
+        r = doc["registros"].get(bid)
         if r is None:
-            intervalo, paso = ("1m", timedelta(minutes=1)) if t - b["utc"] <= CON_1M else ("5m", timedelta(minutes=5))
+            a = doc["agenda"][bid]
+            intervalo, paso = (("1m", timedelta(minutes=1)) if t - de_iso(a["utc"]) <= CON_1M
+                               else ("5m", timedelta(minutes=5)))
             pares = {}
-            for par in instrumentos(b["divisa"]):
+            for par in instrumentos(a["divisa"]):
                 if (par, intervalo) not in cache:
                     try:
                         cache[(par, intervalo)] = descargar(par, intervalo)
                     except Exception as ex:   # sin datos: se reintenta en la ejecución siguiente
                         print(f"aviso: {par} {intervalo}: {ex}", file=sys.stderr)
                         cache[(par, intervalo)] = {}
-                m = medir(cache[(par, intervalo)], b, paso)
+                m = medir(cache[(par, intervalo)], a, paso)
                 if m:
                     pares[par] = m(par)
             if not pares:
                 continue
-            v = ventana(b)
-            r = {"divisa": b["divisa"], "utc": iso(b["utc"]),
-                 "claves": sorted({serie(b["divisa"], e["titulo"]) for e in b["eventos"]})[:10],
-                 "ventana": {"ini": iso(v["entrada"]), "fin": iso(v["salida"]), "min": v["min"]},
-                 "pares": pares, "actual": {}}
+            r = {"divisa": a["divisa"], "utc": a["utc"], "claves": a["claves"],
+                 "ventana": {"ini": a["ini"], "fin": a["fin"], "min": a["min"]}, "pares": pares, "actual": {}}
             nuevos += 1
-        try:
-            res = publicados(b)
-            act, eq = res if isinstance(res, tuple) else (res, {})
-            if act and act != r.get("actual"):
-                r["actual"] = act
-                cambios += 1
-            for k, s in eq.items():
-                if doc["equivalencias"].get(k) != s and len(doc["equivalencias"]) < MAX_EQUIVALENCIAS:
-                    doc["equivalencias"][k] = s
+        if bid in bls:   # el dato publicado y las equivalencias necesitan los títulos (solo con el feed recién pedido)
+            try:
+                res = publicados(bls[bid])
+                act, eq = res if isinstance(res, tuple) else (res, {})
+                if act and act != r.get("actual"):
+                    r["actual"] = act
                     cambios += 1
-        except Exception as ex:
-            print(f"aviso: dato publicado {b['id']}: {ex}", file=sys.stderr)
-        doc["registros"][b["id"]] = r
-    if not nuevos and not cambios and os.path.exists(ruta):
+                for k, x in eq.items():
+                    if doc["equivalencias"].get(k) != x and len(doc["equivalencias"]) < MAX_EQUIVALENCIAS:
+                        doc["equivalencias"][k] = x
+                        cambios += 1
+            except Exception as ex:
+                print(f"aviso: dato publicado {bid}: {ex}", file=sys.stderr)
+        doc["registros"][bid] = r
+    if (previo is not None and not nuevos and not cambios and doc.get("ff") == previo.get("ff")
+            and doc["agenda"] == previo.get("agenda", {})):
         print(f"sin cambios: {len(pend)} pendientes, {len(doc['registros'])} registros")
         return None
     # límites: los registros más antiguos salen primero
