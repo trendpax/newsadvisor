@@ -1,12 +1,12 @@
 # Registro compartido de «Reacciones pasadas» de News Advisor (TrendPax).
-# Cada 3 h mide, con las velas de biquote, las noticias de alto impacto ya publicadas y actualiza reacciones.json en la
+# Cada hora mide, con las velas de biquote, las noticias de alto impacto ya publicadas y actualiza reacciones.json en la
 # rama «datos». Solo resultados derivados (pips por publicación). Sin secretos ni actions de terceros: solo el
 # GITHUB_TOKEN del propio workflow, con permiso de escritura únicamente en este job.
 name: reacciones
 
 on:
   schedule:
-    - cron: "17 */3 * * *"
+    - cron: "17 * * * *"
   workflow_dispatch: {}
 
 permissions: {}
