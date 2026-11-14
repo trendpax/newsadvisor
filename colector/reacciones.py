@@ -1,6 +1,6 @@
 """Colector público del registro compartido de «Reacciones pasadas» de News Advisor (TrendPax).
 
-Lo ejecuta GitHub Actions cada 3 h. Mide, con las velas de biquote, cómo se movieron los pares en la ventana de reacción
+Lo ejecuta GitHub Actions cada hora. Mide, con las velas de biquote, cómo se movieron los pares en la ventana de reacción
 histórica de cada noticia de alto impacto ya publicada (la misma ventana y los mismos instrumentos que el programa) y
 actualiza reacciones.json en la rama «datos». Solo publica resultados derivados por publicación (pips), nunca velas, ni
 títulos ni consensos de terceros: cada serie se identifica con un hash corto de su título normalizado, que el programa
