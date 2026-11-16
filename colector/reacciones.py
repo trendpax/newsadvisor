@@ -39,7 +39,10 @@ PIP.update({ORO: 0.1, CRUDO: 0.01})
 BQ_MULT = {"none": 1.0, "thousands": 1.0, "millions": 1e3, "billions": 1e6, "trillions": 1e9}
 MARGEN = timedelta(minutes=2)
 CON_1M = timedelta(hours=4, minutes=30)
-LIMITE = timedelta(hours=23)
+# Recuperación: biquote guarda las últimas 288 velas de 5 min (~24 h de mercado; con fin de semana, hasta ~3 días). Cada
+# ejecución mira hacia atrás hasta 72 h y mide todo lo que aún tenga velas: un retraso del cron de GitHub no hace perder
+# una noticia mientras sus velas sigan disponibles. Si faltan, medir() no mide y se reintenta en la siguiente.
+RECUPERAR = timedelta(hours=72)
 MAX_REGISTROS = 5000
 MAX_BYTES = 2_000_000
 MAX_DESCARGA = 5_000_000
@@ -249,10 +252,10 @@ def main(ruta, ahora=None, feed=None, descargar=barras, publicados=datos_publica
     # la agenda solo guarda lo que aún se puede medir y, del futuro, solo hasta poco después del próximo feed (no se
     # republica el calendario de la semana)
     ag = {bid: a for bid, a in sorted(doc["agenda"].items())
-          if de_iso(a["utc"]) + LIMITE >= t and de_iso(a["utc"]) <= t + CADA_FF + timedelta(hours=1)}
+          if de_iso(a["utc"]) + RECUPERAR >= t and de_iso(a["utc"]) <= t + CADA_FF + timedelta(hours=1)}
     doc["agenda"] = dict(list(ag.items())[-MAX_AGENDA:])
     pend = [bid for bid, a in doc["agenda"].items()
-            if de_iso(a["fin"]) + MARGEN <= t <= de_iso(a["utc"]) + LIMITE
+            if de_iso(a["fin"]) + MARGEN <= t <= de_iso(a["utc"]) + RECUPERAR
             and (bid not in doc["registros"] or not doc["registros"][bid].get("actual"))]
     con_eq = set(doc["equivalencias"].values())
     sin_eq = [b["id"] for b in bls.values() if b["id"] in doc["registros"] and b["id"] not in pend and b["utc"] <= t
