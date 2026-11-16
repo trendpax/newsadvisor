@@ -43,6 +43,7 @@ CON_1M = timedelta(hours=4, minutes=30)
 # ejecución mira hacia atrás hasta 72 h y mide todo lo que aún tenga velas: un retraso del cron de GitHub no hace perder
 # una noticia mientras sus velas sigan disponibles. Si faltan, medir() no mide y se reintenta en la siguiente.
 RECUPERAR = timedelta(hours=72)
+MAX_PERDIDOS = 200   # bloques que pasaron las 72 h sin poder medirse: {id del bloque: cuándo se dio por perdido}
 MAX_REGISTROS = 5000
 MAX_BYTES = 2_000_000
 MAX_DESCARGA = 5_000_000
@@ -181,6 +182,16 @@ def valido(doc):
             de_iso(doc["ff"])
         except (ValueError, TypeError, AttributeError):
             return False
+    pe = doc.get("perdidos", {})
+    if not isinstance(pe, dict) or len(pe) > MAX_PERDIDOS:
+        return False
+    for bid, x in pe.items():
+        try:
+            if not BID.fullmatch(bid):
+                return False
+            de_iso(x)
+        except (ValueError, TypeError, AttributeError):
+            return False
     for bid, r in doc["registros"].items():
         if not BID.fullmatch(bid) or not isinstance(r, dict):
             return False
@@ -229,6 +240,7 @@ def main(ruta, ahora=None, feed=None, descargar=barras, publicados=datos_publica
         doc["registros"] = previo["registros"]
         doc["equivalencias"] = dict(previo.get("equivalencias", {}))
         doc["agenda"] = dict(previo.get("agenda", {}))
+        doc["perdidos"] = dict(previo.get("perdidos", {}))
         if previo.get("ff"):
             doc["ff"] = previo["ff"]
     bls = {}
@@ -249,6 +261,13 @@ def main(ruta, ahora=None, feed=None, descargar=barras, publicados=datos_publica
             print(f"calendario no válido ({ex})", file=sys.stderr)
             bls, nuevas = {}, {}
         doc["agenda"].update(nuevas)
+    # lo que pasa de las 72 h sin medirse queda anotado como perdido (para la vigilancia)
+    for bid, a in doc["agenda"].items():
+        if de_iso(a["utc"]) + RECUPERAR < t and bid not in doc["registros"] and bid not in doc.setdefault("perdidos", {}):
+            doc["perdidos"][bid] = iso(t)
+            print(f"aviso: PERDIDO {bid}: pasaron 72 h sin velas para medirlo", file=sys.stderr)
+    if doc.get("perdidos"):
+        doc["perdidos"] = dict(sorted(doc["perdidos"].items())[-MAX_PERDIDOS:])
     # la agenda solo guarda lo que aún se puede medir y, del futuro, solo hasta poco después del próximo feed (no se
     # republica el calendario de la semana)
     ag = {bid: a for bid, a in sorted(doc["agenda"].items())
@@ -302,7 +321,7 @@ def main(ruta, ahora=None, feed=None, descargar=barras, publicados=datos_publica
                 print(f"aviso: dato publicado {bid}: {ex}", file=sys.stderr)
         doc["registros"][bid] = r
     if (previo is not None and not nuevos and not cambios and doc.get("ff") == previo.get("ff")
-            and doc["agenda"] == previo.get("agenda", {})):
+            and doc["agenda"] == previo.get("agenda", {}) and doc.get("perdidos", {}) == previo.get("perdidos", {})):
         print(f"sin cambios: {len(pend)} pendientes, {len(doc['registros'])} registros")
         return None
     # límites: los registros más antiguos salen primero
