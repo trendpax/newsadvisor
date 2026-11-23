@@ -124,7 +124,12 @@ def ventana(bloque):
 SINONIMOS = [("non-farm employment change", "nonfarm payrolls"), ("unemployment claims", "initial jobless claims"),
              ("advance gdp", "gdp"), ("prelim gdp", "gdp"), ("final gdp", "gdp"), ("flash ", ""),
              ("ism services pmi", "ism non-manufacturing pmi"), ("cb consumer confidence", "cb consumer confidence index"),
-             ("crude oil inventories", "eia crude oil stocks change")]
+             ("crude oil inventories", "eia crude oil stocks change"),
+             # nombres de otros proveedores de biquote (p. ej., fxempire para el Reino Unido)
+             ("gdp annual growth rate", "gdp y/y"), ("gdp growth rate", "gdp q/q"), ("inflation rate", "cpi")]
+
+
+PERIODO_TOKEN = {"yoy": "y/y", "mom": "m/m", "qoq": "q/q"}
 
 
 PERIODOS = {"m/m", "y/y", "q/q"}
@@ -134,7 +139,7 @@ def _norm(t):
     t = t.lower()
     for a, b in SINONIMOS:
         t = t.replace(a, b)
-    return set(re.findall(r"[a-z0-9/]+", t))
+    return {PERIODO_TOKEN.get(x, x) for x in re.findall(r"[a-z0-9/]+", t)}
 
 
 def _emparejar(ev, cands):
@@ -143,7 +148,7 @@ def _emparejar(ev, cands):
     if ind and ind[0] == "tipos":
         for c in cands:
             n = c["name"].lower()
-            if "interest rate decision" in n and "deposit" not in n:
+            if ("interest rate decision" in n or n.strip() == "interest rate") and "deposit" not in n:
                 return c
     if ind is None or ind[0] == "texto":
         return None
