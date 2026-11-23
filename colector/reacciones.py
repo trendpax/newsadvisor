@@ -48,9 +48,10 @@ MAX_REGISTROS = 5000
 MAX_BYTES = 2_000_000
 MAX_DESCARGA = 5_000_000
 HEX12 = re.compile(r"[0-9a-f]{12}")
-ID_BQ = re.compile(r"[a-z0-9_]{1,20}:[0-9]{1,15}")
+ID_BQ = re.compile(r"[a-z0-9_]{1,20}(?::[a-z0-9_-]{1,40}){1,3}")
 MAX_EQUIVALENCIAS = 2000
 MAX_SIN_EQ = 3   # bloques ya registrados a los que, como mucho, se busca la equivalencia en cada ejecución
+MAX_CONSULTAS = 12   # bloques cuyo dato publicado se consulta a biquote, como mucho, en cada ejecución (2 GET por bloque)
 CADA_FF = timedelta(hours=3)   # norma del proyecto: el feed de Forex Factory, como mucho 1 petición cada 3 h
 MAX_AGENDA = 200
 BID = re.compile(r"\d{8}-\d{4}-(USD|EUR|GBP|JPY|CHF|CAD|AUD|NZD|OIL)")
@@ -283,7 +284,8 @@ def main(ruta, ahora=None, feed=None, descargar=barras, publicados=datos_publica
     if sin_eq:   # rotando, para que un bloque que nunca empareja no tape a los demás
         i = t.hour % len(sin_eq)
         sin_eq = (sin_eq[i:] + sin_eq[:i])[:MAX_SIN_EQ]
-    cache, nuevos, cambios = {}, 0, 0
+    cache, nuevos, cambios, consultas = {}, 0, 0, 0
+    pend = sorted(pend, reverse=True)   # con el tope de consultas, primero las más recientes
     for bid in pend + sin_eq:
         r = doc["registros"].get(bid)
         if r is None:
@@ -306,7 +308,10 @@ def main(ruta, ahora=None, feed=None, descargar=barras, publicados=datos_publica
             r = {"divisa": a["divisa"], "utc": a["utc"], "claves": a["claves"],
                  "ventana": {"ini": a["ini"], "fin": a["fin"], "min": a["min"]}, "pares": pares, "actual": {}}
             nuevos += 1
-        if bid in bls:   # el dato publicado y las equivalencias necesitan los títulos (solo con el feed recién pedido)
+        indicadores = bid in bls and any((indicador(e["titulo"]) or ("texto",))[0] != "texto"
+                                         for e in bls[bid]["eventos"])
+        if indicadores and consultas < MAX_CONSULTAS:   # dato y equivalencias necesitan los títulos (feed recién pedido)
+            consultas += 1
             try:
                 res = publicados(bls[bid])
                 act, eq = res if isinstance(res, tuple) else (res, {})
