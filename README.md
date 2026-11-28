@@ -1,7 +1,7 @@
 # newsadvisor
 News Advisor (TrendPax): instaladores y actualizaciones / installers and updates
 
-- Descargas / downloads: [Releases](https://github.com/trendpax/newsadvisor/releases/latest) · https://trendpax.com
+- Descargas / downloads: https://trendpax.com (con tu cuenta gratuita / with your free account)
 - Novedades / news: https://t.me/trendpax
 
 ## Registro compartido de «Reacciones pasadas» / shared “Past reactions” record
